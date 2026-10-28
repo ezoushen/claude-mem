@@ -611,6 +611,12 @@ async function buildHooks() {
         'ollama',
         '@chroma-core/default-embed',
         'onnxruntime-node',
+        // @huggingface/transformers is reached only through request-time dynamic imports
+        // (LocalEmbedder, ObservationVectorIndex). Bundling it would inline 750 KB of
+        // ONNX glue while onnxruntime-node and sharp stay external; as in the server
+        // bundle below, the dynamic import resolves against plugin/node_modules.
+        '@huggingface/transformers',
+        'sharp',
         // better-auth (~3.7MB) is only reachable through BetterAuthRoutes' request-time
         // dynamic import('better-auth/node') / import('./auth.js'). esbuild otherwise
         // inlines that dynamic-import target into the worker bundle, dragging in the full
