@@ -12,8 +12,8 @@
  * choice: the server's Postgres column is declared vector(dims), so the
  * schema reads it from here (see applyVectorSchema).
  *
- * CLAUDE_MEM_EMBEDDING_MODEL names the entry in use; the other three entries
- * are the multilingual candidates measured in rich-murphey/claude-mem-search-eval.
+ * CLAUDE_MEM_EMBEDDING_MODEL names the entry in use; the entries after the
+ * default are the multilingual candidates measured in rich-murphey/claude-mem-search-eval.
  */
 export interface EmbeddingModel {
   /** Hugging Face repository transformers.js loads. */
@@ -73,6 +73,25 @@ export const EMBEDDING_MODELS = {
     dtype: 'fp32',
     pooling: 'cls',
     dims: 384,
+    maxTokens: 512,
+    queryPrefix: '',
+    passagePrefix: '',
+  },
+  // BAAI/bge-m3 (XLM-RoBERTa large, 568M parameters, MIT). Its dense vector is
+  // the [CLS] token's, as its sentence-transformers pooling config sets, with
+  // no prompts. Trained to 8192 tokens; cut at 512 for the same reason as
+  // granite, and because 512 is what was measured: on a 205k-observation
+  // mixed English/Chinese store it ranked best of these models, and was the
+  // only one to find English notes from Chinese questions (#3610). It is
+  // about twenty times e5-small's compute and its fp32 weights are 2.3 GB
+  // (Xenova/bge-m3 also publishes fp16, int8 and q4 files, which this table's
+  // dtype does not select yet), so it suits a machine that can afford it,
+  // not a default.
+  'bge-m3': {
+    repo: 'Xenova/bge-m3',
+    dtype: 'fp32',
+    pooling: 'cls',
+    dims: 1024,
     maxTokens: 512,
     queryPrefix: '',
     passagePrefix: '',
