@@ -299,7 +299,8 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CHROMA_EMBEDDING_FUNCTION: string;  // chroma-mcp embedding function for new collections
   CLAUDE_MEM_SERVER_VECTOR_SEARCH: string;       // server search by meaning: 'auto', 'true' or 'false'
   CLAUDE_MEM_EMBEDDING_BACKFILL_THREADS: string; // CPU threads for embedding stored rows; '' = half, 0 = all
-  CLAUDE_MEM_EMBEDDING_MODEL: string;            // in-process embedding model for server search by meaning
+  CLAUDE_MEM_EMBEDDING_MODEL: string;            // in-process embedding model for search by meaning (server, and the worker's vector index)
+  CLAUDE_MEM_VECTOR_INDEX_ENABLED: string;       // worker search by meaning from an in-file vector index: 'true' or 'false'
   CLAUDE_MEM_CHROMA_UVX_PATH: string;            // uvx binary (or its folder) to launch chroma-mcp with
   CLAUDE_MEM_SEARCH_RECENCY_DAYS: string;        // Implicit 90-day recency window on date-less semantic searches (#4770); 0 = no window
   // Worker-native cloud sync. Active ⇔ TOKEN, USER_ID, and HUB_URL are all
@@ -602,6 +603,12 @@ export class SettingsDefaultsManager {
     // every observation, and search by meaning covers only rows already
     // re-embedded until that finishes.
     CLAUDE_MEM_EMBEDDING_MODEL: 'all-MiniLM-L6-v2',
+    // The local worker's search by meaning without Chroma: observations get a
+    // vector from CLAUDE_MEM_EMBEDDING_MODEL in claude-mem.db, embedded in the
+    // background (newest first), and keyword search results for observations
+    // are fused with the nearest vectors by reciprocal rank. Applies only when
+    // CLAUDE_MEM_CHROMA_ENABLED is 'false'. Restart the worker after changing.
+    CLAUDE_MEM_VECTOR_INDEX_ENABLED: 'false',
     CLAUDE_MEM_CHROMA_UVX_PATH: '',            // Empty = search uv's install folders, then PATH (#4195)
     CLAUDE_MEM_SEARCH_RECENCY_DAYS: '90',      // Date-less semantic search only ranks matches from the last N days (#4770). 0 = no window (every match eligible); an explicit dateStart/dateEnd always wins. Restart the worker after changing it
     // Worker-native cloud sync: credentials come from cmem.ai → Connect.
