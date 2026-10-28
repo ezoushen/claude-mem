@@ -23,6 +23,8 @@ import { assertSearchHasQueryOrFilter } from './search/SearchOrchestrator.js';
 import { isCategoryRequested } from './search/types.js';
 import { ResultFormatter } from './search/ResultFormatter.js';
 import { ChromaUnavailableError } from './search/errors.js';
+import type { ObservationVectorIndex } from '../vector/ObservationVectorIndex.js';
+import { reciprocalRankFusion } from '../vector/rrf.js';
 import { buildProjectWhereFilter, projectReadKeysFor } from './search/project-where-filter.js';
 
 /**
@@ -54,7 +56,13 @@ export class SearchManager {
      * An explicit `dateRange` on a request always wins over it.
      */
     private searchRecencyWindowMs: number = SEARCH_CONSTANTS.RECENCY_WINDOW_MS,
-    private contextReader: ContextReadWorkerClient | null = null
+    private contextReader: ContextReadWorkerClient | null = null,
+    /**
+     * The local observation vector index (CLAUDE_MEM_VECTOR_INDEX_ENABLED).
+     * Null leaves every search path as it was; set, the keyword path fuses
+     * its observation results with search by meaning.
+     */
+    private observationVectors: ObservationVectorIndex | null = null
   ) {
     this.orchestrator = new SearchOrchestrator(
       sessionSearch,
@@ -457,6 +465,7 @@ export class SearchManager {
     let chromaFailed = false;
     let chromaSupplementStrategy: StrategySearchResult['strategy'] = 'chroma';
     let chromaFailureReason: { message: string; isConnectionError: boolean } | null = null;
+    let vectorsUsed = false;
 
     // `type` historically doubles as a document-category selector
     // ('observations' | 'sessions' | 'prompts'). But it is documented in the
@@ -594,7 +603,11 @@ export class SearchManager {
     else if (query) {
       logger.debug('SEARCH', 'ChromaDB not initialized — falling back to FTS5 keyword search', {});
       try {
-        if (searchObservations) {
+        if (searchObservations && this.observationVectors) {
+          const fused = await this.searchObservationsFused(query, { ...options, type: effectiveObsType, concepts, files });
+          observations = fused.observations;
+          vectorsUsed = fused.vectorsUsed;
+        } else if (searchObservations) {
           observations = this.contextReader
             ? await this.contextReader.searchObservations(query, { ...options, type: effectiveObsType, concepts, files })
             : this.sessionSearch.searchObservations(query, { ...options, type: effectiveObsType, concepts, files });
@@ -645,6 +658,10 @@ export class SearchManager {
           searchStrategy = 'chroma';
           fallbackReason = 'none';
         }
+      } else if (vectorsUsed) {
+        // PATH 3 with the local vector index: keyword and meaning, fused.
+        searchStrategy = 'hybrid';
+        fallbackReason = 'none';
       } else {
         // PATH 3: FTS5 keyword search (Chroma not initialized)
         searchStrategy = 'fts';
@@ -787,6 +804,63 @@ export class SearchManager {
       return Number(anchor.trim());
     }
     return null;
+  }
+
+  /**
+   * Keyword and vector observation results, fused by reciprocal rank (#3610).
+   * Both lists cover the page and everything before it; the vector hits are
+   * hydrated through the same SQL as Chroma's, which applies the type,
+   * concept and file filters, and an explicit date range is applied to them
+   * here. No implicit recency window: the keyword list beside them has none.
+   * When search by meaning fails, the keyword page answers alone.
+   */
+  private async searchObservationsFused(
+    query: string,
+    options: any
+  ): Promise<{ observations: ObservationSearchResult[]; vectorsUsed: boolean }> {
+    const offset = Math.max(0, Number(options.offset) || 0);
+    const limit = Math.max(1, Number(options.limit) || SEARCH_CONSTANTS.DEFAULT_LIMIT);
+    const window = { ...options, offset: 0, limit: offset + limit };
+    const keyword: ObservationSearchResult[] = this.contextReader
+      ? await this.contextReader.searchObservations(query, window)
+      : this.sessionSearch.searchObservations(query, window);
+
+    let semantic: ObservationSearchResult[];
+    try {
+      const filtered = Boolean(options.type || options.concepts || options.files || options.dateRange);
+      const candidates = filtered ? Math.min(10 * (offset + limit), 2000) : offset + limit;
+      const hits = await this.observationVectors!.search(query, {
+        projects: options.projects ?? (options.project ? [options.project] : undefined),
+        platformSource: options.platformSource,
+      }, candidates);
+      const rows = this.sessionStore.getObservationsByIds(hits.map(hit => hit.id), {
+        orderBy: 'relevance',
+        projects: options.projects,
+        project: options.project,
+        platformSource: options.platformSource,
+        type: options.type,
+        concepts: options.concepts,
+        files: options.files,
+      });
+      const start = options.dateRange?.start ? resolveDateBound(options.dateRange.start, 'start') : undefined;
+      const end = options.dateRange?.end ? resolveDateBound(options.dateRange.end, 'end') : undefined;
+      semantic = rows
+        .filter(row => (start === undefined || row.created_at_epoch >= start)
+          && (end === undefined || row.created_at_epoch <= end))
+        .slice(0, offset + limit);
+    } catch (error) {
+      logger.warn('SEARCH', 'Search by meaning failed; answering from keyword search alone', {},
+        error instanceof Error ? error : new Error(String(error)));
+      return { observations: keyword.slice(offset, offset + limit), vectorsUsed: false };
+    }
+
+    const fused = reciprocalRankFusion([keyword, semantic]);
+    if (options.orderBy === 'date_desc' || options.orderBy === 'date_asc') {
+      fused.sort((a, b) => options.orderBy === 'date_asc'
+        ? a.created_at_epoch - b.created_at_epoch || a.id - b.id
+        : b.created_at_epoch - a.created_at_epoch || b.id - a.id);
+    }
+    return { observations: fused.slice(offset, offset + limit), vectorsUsed: true };
   }
 
   async timeline(args: any): Promise<any> {

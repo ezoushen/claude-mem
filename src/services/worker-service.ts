@@ -20,6 +20,11 @@ import { describeObserverAuthMethod } from './worker/observer-auth-method.js';
 import { logger } from '../utils/logger.js';
 import { ChromaMcpManager } from './sync/ChromaMcpManager.js';
 import { ChromaSync } from './sync/ChromaSync.js';
+import { availableParallelism } from 'node:os';
+import { LocalEmbedder } from './vector/LocalEmbedder.js';
+import { resolveEmbeddingModel } from './vector/models.js';
+import { ObservationVectorIndex } from './vector/ObservationVectorIndex.js';
+import { ObservationVectorIndexer } from './vector/ObservationVectorIndexer.js';
 import { openConfiguredSqliteDatabase } from './sqlite/connection.js';
 import { configureSupervisorSignalHandlers, getSupervisor, startSupervisor } from '../supervisor/index.js';
 import { sanitizeEnv } from '../supervisor/env-sanitizer.js';
@@ -310,6 +315,7 @@ export class WorkerService implements WorkerRef {
   private chromaMcpManager: ChromaMcpManager | null = null;
   private transcriptWatcher: TranscriptWatcher | null = null;
   private memoryFileWatcher: MemoryFileWatcher | null = null;
+  private observationVectorIndexer: ObservationVectorIndexer | null = null;
   private syncClient: SyncClient | null = null;
   private contextCacheService: ContextCacheService | null = null;
   private idleExitMonitor: IdleExitMonitor | null = null;
@@ -897,6 +903,7 @@ export class WorkerService implements WorkerRef {
       }
       const searchRecencyWindowMs = parsedRecencyWindowMs ?? SEARCH_CONSTANTS.RECENCY_WINDOW_MS;
       const contextReader = getContextReadWorker();
+      const observationVectors = this.createObservationVectorIndex(settings);
       const searchManager = new SearchManager(
         this.dbManager.getSessionSearch(),
         this.dbManager.getSessionStore(),
@@ -904,8 +911,12 @@ export class WorkerService implements WorkerRef {
         formattingService,
         timelineService,
         searchRecencyWindowMs,
-        contextReader
+        contextReader,
+        observationVectors
       );
+      if (observationVectors) {
+        this.observationVectorIndexer = new ObservationVectorIndexer(observationVectors);
+      }
       // Precomputed SessionStart context (liveness plan, Phase 6): the route
       // records each live render, the service re-renders on writes.
       this.contextCacheService = new ContextCacheService({
@@ -1029,6 +1040,8 @@ export class WorkerService implements WorkerRef {
       notifyGrokBotIndex();
       // Standing line / project-map edits must reach idle seats too.
       watchGrokBotIndexSettings();
+
+      this.observationVectorIndexer?.start();
 
       if (this.chromaMcpManager) {
         ChromaSync.registerBackfillStore(this.dbManager.getSessionStore());
@@ -1205,6 +1218,42 @@ export class WorkerService implements WorkerRef {
     this.sessionManager.removeSessionImmediate(sessionDbId);
   }
 
+  /**
+   * The local observation vector index, when CLAUDE_MEM_VECTOR_INDEX_ENABLED
+   * is 'true' and Chroma is off; null otherwise, which leaves search as it
+   * was. An unknown CLAUDE_MEM_EMBEDDING_MODEL is logged and disables it
+   * rather than failing the worker. Threads follow the server's
+   * CLAUDE_MEM_EMBEDDING_BACKFILL_THREADS: empty is half the CPU threads, 0
+   * all of them.
+   */
+  private createObservationVectorIndex(settings: ReturnType<typeof SettingsDefaultsManager.loadFromFile>): ObservationVectorIndex | null {
+    if (settings.CLAUDE_MEM_VECTOR_INDEX_ENABLED !== 'true') return null;
+    if (settings.CLAUDE_MEM_CHROMA_ENABLED !== 'false') {
+      logger.warn('VECTOR_INDEX', 'CLAUDE_MEM_VECTOR_INDEX_ENABLED is ignored while Chroma is on; set CLAUDE_MEM_CHROMA_ENABLED=false to use it');
+      return null;
+    }
+    try {
+      const model = resolveEmbeddingModel(settings.CLAUDE_MEM_EMBEDDING_MODEL);
+      const value = settings.CLAUDE_MEM_EMBEDDING_BACKFILL_THREADS.trim();
+      const parsed = Number(value);
+      const threads = value === '' || !Number.isFinite(parsed) || parsed < 0
+        ? Math.max(1, Math.floor(availableParallelism() / 2))
+        : Math.floor(parsed);
+      const index = new ObservationVectorIndex(
+        this.dbManager.getConnection(),
+        new LocalEmbedder(model, threads > 0 ? threads : undefined),
+      );
+      logger.info('VECTOR_INDEX', 'Search by meaning from the local vector index', {
+        model: index.modelId, threads: threads > 0 ? threads : 'all',
+      });
+      return index;
+    } catch (error) {
+      logger.error('VECTOR_INDEX', 'Local vector index unavailable; search stays keyword-only', {},
+        error instanceof Error ? error : new Error(String(error)));
+      return null;
+    }
+  }
+
   async shutdown(reason: WorkerShutdownReason = 'stop'): Promise<void> {
     // Full sequence (re-entrancy guard, graceful-shutdown deadline, restart
     // successor handoff) lives in worker-shutdown.ts so tests can exercise it
@@ -1231,6 +1280,9 @@ export class WorkerService implements WorkerRef {
         this.contextCacheService = null;
         this.memoryFileWatcher?.stop();
         this.memoryFileWatcher = null;
+        // Before the DB closes: a batch in flight finishes its write first.
+        await this.observationVectorIndexer?.stop();
+        this.observationVectorIndexer = null;
 
         await this.codexAgent.close();
         if (this.transcriptWatcher) {

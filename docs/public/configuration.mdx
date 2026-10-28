@@ -458,6 +458,18 @@ Search operations are provided via:
 - **HTTP API**: 10 endpoints on the worker service port (per-user, default `37700 + (uid % 100)`; see `~/.claude-mem/settings.json`)
 - **Auto-Invocation**: Claude recognizes natural language queries about past work
 
+#### Search by meaning without Chroma
+
+With Chroma off (`CLAUDE_MEM_CHROMA_ENABLED=false`) the worker searches observations by keyword only. Setting `CLAUDE_MEM_VECTOR_INDEX_ENABLED` to `true` adds search by meaning from vectors stored in `claude-mem.db` itself; no Python or Chroma process is involved.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `CLAUDE_MEM_VECTOR_INDEX_ENABLED` | `false` | `true` embeds every observation in the background, newest first, and fuses keyword results with the nearest vectors by reciprocal rank. Ignored while Chroma is on. Restart the worker after changing it. |
+| `CLAUDE_MEM_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | The model that makes the vectors (the same setting the hosted server uses; see [Hosted server](hosted-server)). Changing it embeds every observation again. |
+| `CLAUDE_MEM_EMBEDDING_BACKFILL_THREADS` | _(empty — half the CPU threads)_ | CPU threads the model may use; `0` is all of them. |
+
+Vectors live in the table `vec_observation_docs`, one row per observation, tagged with the model that made it; a deleted observation takes its vector with it. Search keeps the vectors of the current model in memory, so the worker holds `dimensions × 4` bytes per observation (4 KB each for `bge-m3`) on top of the model. Summaries and prompts stay keyword-only. With the setting off, or Chroma on, search behaves exactly as without it.
+
 ## Worker Service Management
 
 Worker service is managed by Bun as a background process. The worker auto-starts on first session and runs continuously in the background.
