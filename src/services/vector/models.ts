@@ -115,6 +115,13 @@ export const EMBEDDING_MODELS = {
 
 export const DEFAULT_EMBEDDING_MODEL: EmbeddingModel = EMBEDDING_MODELS['all-MiniLM-L6-v2'];
 
+/** The identity stored with every vector: the model's weights, pooling and token limit. */
+export function embeddingModelId(model: EmbeddingModel): string {
+  // The token limit is part of the identity: the same model truncated
+  // elsewhere produces different vectors for long texts.
+  return `${model.repo}/${model.dtype}/${model.pooling}/l2/${model.maxTokens}`;
+}
+
 /** The model a CLAUDE_MEM_EMBEDDING_MODEL value names; an unknown name is an error. */
 export function resolveEmbeddingModel(name: string): EmbeddingModel {
   const model = (EMBEDDING_MODELS as Record<string, EmbeddingModel>)[name.trim()];

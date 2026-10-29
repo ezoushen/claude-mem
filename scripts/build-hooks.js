@@ -97,6 +97,11 @@ const CONTEXT_READ_WORKER = {
   source: 'src/services/context/context-read-worker.ts'
 };
 
+const EMBED_CHILD = {
+  name: 'embed-child',
+  source: 'src/services/vector/embed-child.ts'
+};
+
 const TRANSCRIPT_WATCHER = {
   name: 'transcript-watcher',
   source: 'src/services/transcripts/transcript-watcher-entry.ts'
@@ -692,6 +697,35 @@ async function buildHooks() {
     });
     assertBundleIntegrity(`${hooksDir}/${CONTEXT_READ_WORKER.name}.cjs`);
 
+    // The process the worker starts to run the embedding model when
+    // CLAUDE_MEM_EMBEDDING_UNLOAD_AFTER_SEC asks for it. Like the server bundle, it
+    // reaches @huggingface/transformers through a dynamic import that must resolve
+    // against plugin/node_modules, not be inlined.
+    await build({
+      entryPoints: [EMBED_CHILD.source],
+      bundle: true,
+      platform: 'node',
+      target: 'node18',
+      format: 'cjs',
+      outfile: `${hooksDir}/${EMBED_CHILD.name}.cjs`,
+      minify: true,
+      ...SOURCEMAP_OPTS,
+      logLevel: 'error',
+      external: ['onnxruntime-node', '@huggingface/transformers', 'sharp'],
+      define: {
+        '__DEFAULT_PACKAGE_VERSION__': JSON.stringify(version),
+        ...DIRNAME_DEFINE,
+        'import.meta.url': '__IMPORT_META_URL__'
+      },
+      banner: {
+        js: [
+          ...DIRNAME_BANNER,
+          'var __IMPORT_META_URL__ = require("node:url").pathToFileURL(__CM_FILENAME__).href;'
+        ].join('\n')
+      }
+    });
+    assertBundleIntegrity(`${hooksDir}/${EMBED_CHILD.name}.cjs`);
+
     // Advisory only — a sudden jump usually means a heavy server-only dependency
     // (better-auth, kysely, a database driver) leaked into the worker bundle via a
     // transitive import (#2584). Never blocks the build.
@@ -1149,6 +1183,8 @@ async function buildHooks() {
       'plugin/scripts/bun-runner.js',
       'plugin/scripts/context-read-worker.cjs',
       'plugin/scripts/context-read-worker.cjs.map',
+      'plugin/scripts/embed-child.cjs',
+      'plugin/scripts/embed-child.cjs.map',
       'plugin/sqlite/SessionStore.js',
       'plugin/sqlite/observations/files.js',
       'plugin/.claude-plugin/plugin.json',
