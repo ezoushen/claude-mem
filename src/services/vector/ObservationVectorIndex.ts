@@ -26,8 +26,16 @@ import { logger } from '../../utils/logger.js';
  *
  * A scan of every row through SQLite took 5 to 8 s at 205k rows of 1024
  * floats, so search keeps the matrix in memory, refreshed from the table by
- * rowid, and scores it with one ONNX Runtime matrix product (about 0.1 s),
- * falling back to a JavaScript loop (about 1 s) if that op is unavailable.
+ * rowid. There each vector is 8-bit integers with one scale (a quarter of the
+ * float32 size: 218 MB for 213k vectors against 870 MB), scored with ONNX
+ * Runtime matrix products over float32 chunks. That ranking is approximate, so
+ * the best candidates (at least 100, four times what was asked for) are read
+ * back from the table as float32 and re-scored exactly. On the 205k-note store
+ * that equals scoring every float32 vector (fused nDCG@10 0.707 both ways; the
+ * 8-bit scores alone lost 0.004). It can differ only among vectors whose
+ * cosines to the query agree within about 1e-3, hundreds of near-duplicates
+ * deep, where the returned notes are practically tied with the exact ones.
+ * If the ONNX op is unavailable a JavaScript loop scores the chunks instead.
  */
 
 export const OBSERVATION_VECTOR_TABLE = 'vec_observation_docs';
@@ -83,18 +91,36 @@ export interface ObservationVectorHit {
   score: number;
 }
 
+/**
+ * Rows widened to float32 for each matrix product. 4,096 rows took 240 ms per
+ * search at 212k vectors, 16,384 took 150 ms and 65,536 took 145 ms; the buffer
+ * is 64 MB at 1024 dimensions.
+ */
+const SCORE_CHUNK_ROWS = 16384;
+
+/** Candidates re-scored from the table: this many, or this multiple of the hits asked for, if more. */
+const RESCORE_MIN = 100;
+const RESCORE_FACTOR = 4;
+/** Candidate ids per rescore query, under SQLite's limit on bound parameters. */
+const RESCORE_BATCH = 500;
+
 interface MatrixCache {
   ids: Int32Array;
-  matrix: Float32Array;
-  /** Rows held in ids and matrix. */
+  /** Row-major, dims per row: each vector as round(component / scale), in -127..127. */
+  matrix: Int8Array;
+  /** Per row: largest absolute component / 127, so component ~ matrix * scale. 0 for a vector of zeros. */
+  scales: Float32Array;
+  /** Rows held in ids, matrix and scales. */
   count: number;
   /** Table rows read, malformed ones included, to compare with COUNT(*). */
   seen: number;
   maxRowid: number;
+  /** sqlite_id of the row at maxRowid, to notice that row being replaced (SQLite reuses a freed highest rowid). */
+  tailId: number;
 }
 
 function emptyCache(): MatrixCache {
-  return { ids: new Int32Array(0), matrix: new Float32Array(0), count: 0, seen: 0, maxRowid: 0 };
+  return { ids: new Int32Array(0), matrix: new Int8Array(0), scales: new Float32Array(0), count: 0, seen: 0, maxRowid: 0, tailId: 0 };
 }
 
 type MatmulOp = (matrix: Float32Array, rows: number, dims: number, probe: Float32Array) => Promise<Float32Array>;
@@ -102,6 +128,9 @@ type MatmulOp = (matrix: Float32Array, rows: number, dims: number, probe: Float3
 export class ObservationVectorIndex {
   private cache: MatrixCache | null = null;
   private matmul: Promise<MatmulOp | null> | null = null;
+  /** Reused by every search to widen 8-bit rows to float32. */
+  private widened: Float32Array | null = null;
+  private scoring: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly db: Database,
@@ -112,6 +141,11 @@ export class ObservationVectorIndex {
 
   get modelId(): string {
     return this.embedder.modelId;
+  }
+
+  /** Bytes the in-memory vectors occupy; 0 until a search has loaded them. */
+  matrixBytes(): number {
+    return this.cache ? this.cache.count * (this.embedder.dims + Float32Array.BYTES_PER_ELEMENT) : 0;
   }
 
   /** Whether the embedding model has loaded; an embedder without a load is always ready. */
@@ -195,10 +229,43 @@ export class ObservationVectorIndex {
     if (!(k > 0)) return [];
     const [probe] = await this.embedder.embed([text], 'query');
     const cache = this.refresh();
-    if (cache.count === 0) return [];
-    const scores = await this.score(cache, probe);
+    // Rows another search appends while this one awaits land beyond this count, in place.
+    const count = cache.count;
+    if (count === 0) return [];
+    const scores = await this.score(cache, count, probe);
     const allowed = this.allowedIds(scope);
-    return topK(scores, cache.ids, cache.count, k, allowed);
+    const candidates = topK(scores, cache.ids, count, Math.max(RESCORE_MIN, RESCORE_FACTOR * k), allowed);
+    return this.rescore(candidates, probe).slice(0, k);
+  }
+
+  /**
+   * Candidates with their cosine to `probe` computed from the float32 vectors in
+   * the table, nearest first. A candidate whose row is gone (the observation was
+   * deleted since the matrix was read) is dropped.
+   */
+  private rescore(candidates: ObservationVectorHit[], probe: Float32Array): ObservationVectorHit[] {
+    const dims = this.embedder.dims;
+    const row32 = new Float32Array(dims); // a stored row, aligned, to read from
+    const row8 = new Uint8Array(row32.buffer);
+    const best = new Map<number, number>();
+    const unique = [...new Set(candidates.map(hit => hit.id))];
+    for (let start = 0; start < unique.length; start += RESCORE_BATCH) {
+      const ids = unique.slice(start, start + RESCORE_BATCH);
+      // `+model_id` keeps SQLite on the sqlite_id index: with model_id indexed too it scans the whole model.
+      const rows = this.db.prepare(
+        `SELECT sqlite_id, embedding FROM ${OBSERVATION_VECTOR_TABLE}
+         WHERE +model_id = ? AND sqlite_id IN (${ids.map(() => '?').join(',')})`,
+      ).values(this.embedder.modelId, ...ids) as [number, Uint8Array | null][];
+      for (const [sqliteId, blob] of rows) {
+        if (!blob || blob.byteLength !== dims * 4) continue;
+        row8.set(blob);
+        let score = 0;
+        for (let d = 0; d < dims; d++) score += row32[d] * probe[d];
+        const id = Number(sqliteId);
+        if (Number.isFinite(score) && !(best.get(id)! >= score)) best.set(id, score);
+      }
+    }
+    return [...best].map(([id, score]) => ({ id, score })).sort((a, b) => b.score - a.score);
   }
 
   /** Ids inside the scope, or null for an unscoped search. */
@@ -235,13 +302,30 @@ export class ObservationVectorIndex {
       `SELECT COUNT(*) AS n, COALESCE(MAX(rowid), 0) AS m FROM ${OBSERVATION_VECTOR_TABLE} WHERE model_id = ?`,
     ).get(modelId) as { n: number; m: number };
     const current = this.cache;
-    if (current && meta.n === current.seen && meta.m === current.maxRowid) return current;
-    let cache = current && meta.n > current.seen && meta.m > current.maxRowid
+    // The last row held may have been deleted and its rowid given to another note.
+    const replaced = current !== null && current.maxRowid > 0 && this.tailIdAt(current.maxRowid) !== current.tailId;
+    if (current && !replaced && meta.n === current.seen && meta.m === current.maxRowid) return current;
+    let cache = current && !replaced && meta.n > current.seen && meta.m > current.maxRowid
       ? this.load(current, current.maxRowid, meta.n - current.seen)
       : null;
-    if (!cache || cache.seen !== meta.n) cache = this.load(emptyCache(), 0, meta.n);
+    if (!cache || cache.seen !== meta.n) {
+      const started = performance.now();
+      cache = this.load(emptyCache(), 0, meta.n);
+      logger.info('VECTOR_INDEX', 'Loaded vectors for search', {
+        vectors: cache.count,
+        megabytes: Math.round(cache.count * (this.embedder.dims + Float32Array.BYTES_PER_ELEMENT) / 1048576),
+        ms: Math.round(performance.now() - started),
+      });
+    }
     this.cache = cache;
     return cache;
+  }
+
+  private tailIdAt(rowid: number): number | null {
+    const row = this.db.prepare(
+      `SELECT sqlite_id FROM ${OBSERVATION_VECTOR_TABLE} WHERE rowid = ? AND model_id = ?`,
+    ).get(rowid, this.embedder.modelId) as { sqlite_id: number } | null;
+    return row ? Number(row.sqlite_id) : null;
   }
 
   /**
@@ -257,10 +341,15 @@ export class ObservationVectorIndex {
        WHERE model_id = ? AND rowid > ? ORDER BY rowid`,
     );
     let cache = grow(base, base.count + expected, dims);
+    const row32 = new Float32Array(dims); // a stored row, aligned, to convert from
+    const row8 = new Uint8Array(row32.buffer);
     let skipped = 0;
     for (const row of rows.iterate(this.embedder.modelId, afterRowid) as Iterable<{ rowid: number; sqlite_id: number; embedding: Uint8Array | null }>) {
       cache.seen++;
-      cache.maxRowid = Math.max(cache.maxRowid, Number(row.rowid));
+      if (Number(row.rowid) > cache.maxRowid) {
+        cache.maxRowid = Number(row.rowid);
+        cache.tailId = Number(row.sqlite_id);
+      }
       const blob = row.embedding;
       if (!blob || blob.byteLength !== dims * 4) {
         skipped++;
@@ -268,7 +357,14 @@ export class ObservationVectorIndex {
       }
       // Rows written by another process since the count was taken.
       if (cache.count === cache.ids.length) cache = grow(cache, cache.count + 1, dims);
-      new Uint8Array(cache.matrix.buffer, cache.count * dims * 4, dims * 4).set(blob);
+      row8.set(blob);
+      let largest = 0;
+      for (let d = 0; d < dims; d++) largest = Math.max(largest, Math.abs(row32[d]));
+      const scale = largest / 127;
+      const at = cache.count * dims;
+      // A vector of zeros divides 0 by 0, which an Int8Array stores as 0; one with a NaN gets a NaN scale and never ranks.
+      for (let d = 0; d < dims; d++) cache.matrix[at + d] = Math.round(row32[d] / scale);
+      cache.scales[cache.count] = scale;
       cache.ids[cache.count] = Number(row.sqlite_id);
       cache.count++;
     }
@@ -276,13 +372,34 @@ export class ObservationVectorIndex {
     return cache;
   }
 
-  private async score(cache: MatrixCache, probe: Float32Array): Promise<Float32Array> {
+  /** One search scores at a time: they share the widening buffer, and each awaits the matrix product between chunks. */
+  private score(cache: MatrixCache, count: number, probe: Float32Array): Promise<Float32Array> {
+    const run = this.scoring.then(() => this.scoreRows(cache, count, probe));
+    this.scoring = run.catch(() => undefined);
+    return run;
+  }
+
+  private async scoreRows(cache: MatrixCache, count: number, probe: Float32Array): Promise<Float32Array> {
     const dims = this.embedder.dims;
+    const need = Math.min(SCORE_CHUNK_ROWS, count) * dims;
+    if ((this.widened?.length ?? 0) < need) this.widened = new Float32Array(need);
+    const widened = this.widened!;
+    const scores = new Float32Array(count);
     this.matmul ??= loadOnnxMatmul();
+    for (let start = 0; start < count; start += SCORE_CHUNK_ROWS) {
+      const rows = Math.min(SCORE_CHUNK_ROWS, count - start);
+      widened.set(cache.matrix.subarray(start * dims, (start + rows) * dims));
+      const part = await this.scoreChunk(widened.subarray(0, rows * dims), rows, dims, probe);
+      for (let r = 0; r < rows; r++) scores[start + r] = part[r] * cache.scales[start + r];
+    }
+    return scores;
+  }
+
+  private async scoreChunk(chunk: Float32Array, rows: number, dims: number, probe: Float32Array): Promise<Float32Array> {
     const op = await this.matmul;
     if (op) {
       try {
-        return await op(cache.matrix.subarray(0, cache.count * dims), cache.count, dims, probe);
+        return await op(chunk, rows, dims, probe);
       } catch (error) {
         logger.warn('VECTOR_INDEX', 'ONNX matrix product failed; scoring in JavaScript', {
           error: error instanceof Error ? error.message : String(error),
@@ -290,7 +407,7 @@ export class ObservationVectorIndex {
         this.matmul = Promise.resolve(null);
       }
     }
-    return scoreInJs(cache.matrix, cache.count, dims, probe);
+    return scoreInJs(chunk, rows, dims, probe);
   }
 }
 
@@ -303,9 +420,11 @@ function grow(cache: MatrixCache, rows: number, dims: number): MatrixCache {
   const capacity = Math.max(Math.ceil(rows * 1.1), 1024);
   const ids = new Int32Array(capacity);
   ids.set(cache.ids.subarray(0, cache.count));
-  const matrix = new Float32Array(capacity * dims);
+  const matrix = new Int8Array(capacity * dims);
   matrix.set(cache.matrix.subarray(0, cache.count * dims));
-  return { ...cache, ids, matrix };
+  const scales = new Float32Array(capacity);
+  scales.set(cache.scales.subarray(0, cache.count));
+  return { ...cache, ids, matrix, scales };
 }
 
 async function loadOnnxMatmul(): Promise<MatmulOp | null> {
