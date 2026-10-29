@@ -83,6 +83,25 @@ describe('ObservationVectorIndex', () => {
     expect((await index.search('memory', {}, 5)).map(hit => hit.id)).toEqual([second]);
   });
 
+  it('finds every note that arrives after the first search, however many', async () => {
+    const quota = addObservation('p', 'Gateway quota exhausted');
+    await index.index(index.pendingRows(10));
+    expect((await index.search('quota', {}, 5)).map(hit => hit.id)).toEqual([quota]);
+
+    // More notes than the matrix first had room for.
+    const routers: number[] = [];
+    for (let i = 0; i < 1100; i++) routers.push(addObservation('p', `Router note ${i}`));
+    while (index.pendingCount() > 0) await index.index(index.pendingRows(250));
+
+    const found = (await index.search('router', {}, 2000)).map(hit => hit.id);
+    expect(found.slice(0, routers.length).sort((a, b) => a - b)).toEqual(routers);
+    // The note that was already in the matrix keeps its vector: "Gateway quota" shares one of its
+    // two topics with the query "quota", so cosine is 1 / sqrt(2).
+    const [first] = await index.search('quota', {}, 1);
+    expect(first.id).toBe(quota);
+    expect(first.score).toBeCloseTo(Math.SQRT1_2, 5);
+  });
+
   it('treats vectors from another model as missing', async () => {
     addObservation('p', 'Deadline');
     await index.index(index.pendingRows(10));
