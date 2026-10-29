@@ -20,6 +20,14 @@ export interface EmbeddingModel {
   repo: string;
   /** Part of the model id, so changing it re-indexes. */
   dtype: EmbeddingDtype;
+  /**
+   * The Hugging Face commit to download from, so a later upload to the
+   * repository cannot change the model under stored vectors. Not part of the
+   * model id: pin only a commit whose files match what the id was built with.
+   * Unset follows the repository's main branch. A pinned commit is cached
+   * apart from main, so pinning an installed model downloads it once more.
+   */
+  revision?: string;
   /** mean: the average over real tokens; cls: the first token's vector. */
   pooling: 'mean' | 'cls';
   /** Vector length; sizes the server's vector(n) column. */
@@ -105,6 +113,9 @@ export const EMBEDDING_MODELS = {
   'bge-m3': {
     repo: 'Xenova/bge-m3',
     dtype: 'q8',
+    // Main as of 2026-02-10; its onnx/model_quantized.onnx (sha256 0826f8c1…0b77d)
+    // is the file every q8 result above was measured with.
+    revision: '4de13258303883538bd53b696b452bf8099f0858',
     pooling: 'cls',
     dims: 1024,
     maxTokens: 512,
