@@ -468,7 +468,7 @@ With Chroma off (`CLAUDE_MEM_CHROMA_ENABLED=false`) the worker searches observat
 | `CLAUDE_MEM_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | The model that makes the vectors (the same setting the hosted server uses; see [Hosted server](hosted-server)). Changing it embeds every observation again. |
 | `CLAUDE_MEM_EMBEDDING_BACKFILL_THREADS` | _(empty — half the CPU threads)_ | CPU threads the model may use; `0` is all of them. |
 
-Vectors live in the table `vec_observation_docs`, one row per observation, tagged with the model that made it; a deleted observation takes its vector with it. Search keeps the vectors of the current model in memory, so the worker holds `dimensions × 4` bytes per observation (4 KB each for `bge-m3`) on top of the model. Summaries and prompts stay keyword-only. With the setting off, or Chroma on, search behaves exactly as without it.
+Vectors live in the table `vec_observation_docs`, one row per observation, tagged with the model that made it; a deleted observation takes its vector with it. Search keeps the vectors of the current model in memory, so the worker holds about `dimensions + 4` bytes per observation (1 KB each for `bge-m3`, as 8-bit integers with a scale) on top of the model; the best matches are re-scored from the stored float32 vectors, so the ranking matches float32 scoring except among near-identical notes. Summaries and prompts stay keyword-only. With the setting off, or Chroma on, search behaves exactly as without it.
 
 ## Worker Service Management
 
