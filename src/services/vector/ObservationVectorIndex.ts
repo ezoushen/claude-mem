@@ -237,30 +237,39 @@ export class ObservationVectorIndex {
     const current = this.cache;
     if (current && meta.n === current.seen && meta.m === current.maxRowid) return current;
     let cache = current && meta.n > current.seen && meta.m > current.maxRowid
-      ? this.load(current, current.maxRowid)
+      ? this.load(current, current.maxRowid, meta.n - current.seen)
       : null;
-    if (!cache || cache.seen !== meta.n) cache = this.load(emptyCache(), 0);
+    if (!cache || cache.seen !== meta.n) cache = this.load(emptyCache(), 0, meta.n);
     this.cache = cache;
     return cache;
   }
 
-  private load(base: MatrixCache, afterRowid: number): MatrixCache {
+  /**
+   * Read the rows after `afterRowid` into the matrix one at a time: `expected`
+   * rows are counted before the read so the matrix is sized once, and no copy
+   * of every embedding is held beside it (a store of 212k bge-m3 vectors is
+   * 870 MB, and reading the whole result first doubled the load's peak).
+   */
+  private load(base: MatrixCache, afterRowid: number, expected: number): MatrixCache {
     const dims = this.embedder.dims;
     const rows = this.db.prepare(
       `SELECT rowid, sqlite_id, embedding FROM ${OBSERVATION_VECTOR_TABLE}
        WHERE model_id = ? AND rowid > ? ORDER BY rowid`,
-    ).values(this.embedder.modelId, afterRowid) as [number, number, Uint8Array][];
-    const cache = grow(base, base.count + rows.length, dims);
+    );
+    let cache = grow(base, base.count + expected, dims);
     let skipped = 0;
-    for (const [rowid, sqliteId, blob] of rows) {
+    for (const row of rows.iterate(this.embedder.modelId, afterRowid) as Iterable<{ rowid: number; sqlite_id: number; embedding: Uint8Array | null }>) {
       cache.seen++;
-      cache.maxRowid = Math.max(cache.maxRowid, Number(rowid));
+      cache.maxRowid = Math.max(cache.maxRowid, Number(row.rowid));
+      const blob = row.embedding;
       if (!blob || blob.byteLength !== dims * 4) {
         skipped++;
         continue;
       }
+      // Rows written by another process since the count was taken.
+      if (cache.count === cache.ids.length) cache = grow(cache, cache.count + 1, dims);
       new Uint8Array(cache.matrix.buffer, cache.count * dims * 4, dims * 4).set(blob);
-      cache.ids[cache.count] = Number(sqliteId);
+      cache.ids[cache.count] = Number(row.sqlite_id);
       cache.count++;
     }
     if (skipped > 0) logger.warn('VECTOR_INDEX', 'Skipped malformed embeddings', { skipped, dims });
@@ -285,9 +294,13 @@ export class ObservationVectorIndex {
   }
 }
 
+/**
+ * Room for `rows`, plus a tenth more: untouched capacity costs no resident
+ * memory, and the next notes then land without copying the whole matrix.
+ */
 function grow(cache: MatrixCache, rows: number, dims: number): MatrixCache {
   if (cache.ids.length >= rows) return cache;
-  const capacity = Math.max(rows, Math.ceil(cache.ids.length * 1.5), 1024);
+  const capacity = Math.max(Math.ceil(rows * 1.1), 1024);
   const ids = new Int32Array(capacity);
   ids.set(cache.ids.subarray(0, cache.count));
   const matrix = new Float32Array(capacity * dims);
