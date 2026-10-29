@@ -36,6 +36,11 @@ to set it up and reproduce the measurements on your own store.
   memory as 1 KB, and can run its model in a process that exits when idle: the worker then holds 0.4 GB.
 - **Indexing.** Chroma indexed about 25 to 31 documents a second here, which is 12 to 15 hours for that
   store. This branch's GPU script does it in 23 minutes; the worker alone, on the CPU, in most of a day.
+- **Reliability.** On this machine Chroma's index broke on 2026-09-12: `chroma-mcp` crash-looped about 60
+  times an hour (1,063 crashes) on a write-ahead log it could not replay, and search by meaning silently fell
+  back to keyword search for three days until the index was rebuilt from scratch. In late October its sync
+  was again failing batches under connection backoff. The vectors here are rows in the same SQLite database
+  as the notes: there is no second store or process to fall out of step.
 
 The numbers come from one store (claude-mem 15.4.0 to 15.5.0, 205k to 214k observations, mostly English
 with about 700 Chinese notes, Apple M5 Max with 128 GB). The queries and grades describe private work, so
@@ -65,10 +70,13 @@ Memory on that store (macOS physical footprint; peak in brackets):
 | Chroma | 75 to 98 MB | `chroma-mcp` 0.39 to 0.65 GB (0.82 GB), plus `uvx` 23 to 143 MB | the same: Chroma stays up |
 | this branch | 155 to 175 MB (0.20 GB) | embedding process 1.6 GB (2.1 GB while loading) | worker only, 155 MB, once the embedding process has exited |
 
-On disk: Chroma's index took 309 MB for these notes, this branch's vectors 43 MB inside `claude-mem.db`.
+On disk: Chroma's index took 309 MB for these notes (about 5 KB per document), this branch's vectors 43 MB
+inside `claude-mem.db`. On the whole store, the Chroma folder this machine ran in production until 2026-10-28
+was 1.7 GB at 369,641 documents (2026-09-15), 5.1 GB on 2026-10-25, and freed 6.9 GB when it was deleted;
+this branch's vectors for the same store are 0.87 GB.
 
-At the whole store (215k notes) only this branch was measured: worker 0.4 GB (0.9 GB peak), embedding process
-0.8 to 1.3 GB while it runs, vectors 0.87 GB on disk. Chroma there would hold 1.35 million 384-dimension
+At the whole store (215k notes) memory was measured for this branch only: worker 0.4 GB (0.9 GB peak),
+embedding process 0.8 to 1.3 GB while it runs. Chroma there would hold 1.35 million 384-dimension
 vectors; their float32 values alone are 2.1 GB, which its HNSW index keeps in memory for as long as it runs.
 That is an estimate from the document count, not a measurement.
 
@@ -306,7 +314,9 @@ back on and restart.
 ## Limits
 
 - One store, one owner, 42 graded queries with 7 to 15 per group: differences of a few hundredths are noise.
-- The comparison with Chroma ran on 11k of the 215k notes; at the full store only this branch was measured.
+- The comparison with Chroma ran on 11k of the 215k notes. At the full store, Chroma's disk size comes from
+  the production install it replaced (whether that index was complete when deleted is not known), and its
+  memory was not measured.
   Grading was pooled (a relevant note no method found is never graded) and done by a model.
 - Only observations are embedded; summaries and prompts stay keyword-only. One document per observation
   (title, subtitle and narrative), where Chroma and #3694 split notes into several.
