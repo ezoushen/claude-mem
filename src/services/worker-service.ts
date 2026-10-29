@@ -21,8 +21,10 @@ import { logger } from '../utils/logger.js';
 import { ChromaMcpManager } from './sync/ChromaMcpManager.js';
 import { ChromaSync } from './sync/ChromaSync.js';
 import { availableParallelism } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { ChildProcessEmbedder } from './vector/ChildProcessEmbedder.js';
 import { LocalEmbedder } from './vector/LocalEmbedder.js';
-import { resolveEmbeddingModel } from './vector/models.js';
+import { embeddingModelId, resolveEmbeddingModel } from './vector/models.js';
 import { ObservationVectorIndex } from './vector/ObservationVectorIndex.js';
 import { ObservationVectorIndexer } from './vector/ObservationVectorIndexer.js';
 import { openConfiguredSqliteDatabase } from './sqlite/connection.js';
@@ -316,6 +318,7 @@ export class WorkerService implements WorkerRef {
   private transcriptWatcher: TranscriptWatcher | null = null;
   private memoryFileWatcher: MemoryFileWatcher | null = null;
   private observationVectorIndexer: ObservationVectorIndexer | null = null;
+  private observationEmbedder: ChildProcessEmbedder | null = null;
   private syncClient: SyncClient | null = null;
   private contextCacheService: ContextCacheService | null = null;
   private idleExitMonitor: IdleExitMonitor | null = null;
@@ -1239,12 +1242,26 @@ export class WorkerService implements WorkerRef {
       const threads = value === '' || !Number.isFinite(parsed) || parsed < 0
         ? Math.max(1, Math.floor(availableParallelism() / 2))
         : Math.floor(parsed);
-      const index = new ObservationVectorIndex(
-        this.dbManager.getConnection(),
-        new LocalEmbedder(model, threads > 0 ? threads : undefined),
-      );
+      const unloadAfterSec = Number(settings.CLAUDE_MEM_EMBEDDING_UNLOAD_AFTER_SEC);
+      const childScript = fileURLToPath(new URL('embed-child.cjs', import.meta.url));
+      let embedder: LocalEmbedder | ChildProcessEmbedder;
+      if (unloadAfterSec > 0 && !existsSync(childScript)) {
+        logger.warn('VECTOR_INDEX', 'CLAUDE_MEM_EMBEDDING_UNLOAD_AFTER_SEC is ignored: the embedding process is missing', { childScript });
+      }
+      if (unloadAfterSec > 0 && existsSync(childScript)) {
+        embedder = this.observationEmbedder = new ChildProcessEmbedder({
+          modelId: embeddingModelId(model),
+          dims: model.dims,
+          command: [process.execPath, childScript, settings.CLAUDE_MEM_EMBEDDING_MODEL.trim(), String(threads)],
+          idleMs: unloadAfterSec * 1000,
+        });
+      } else {
+        embedder = new LocalEmbedder(model, threads > 0 ? threads : undefined);
+      }
+      const index = new ObservationVectorIndex(this.dbManager.getConnection(), embedder);
       logger.info('VECTOR_INDEX', 'Search by meaning from the local vector index', {
         model: index.modelId, threads: threads > 0 ? threads : 'all',
+        embeddingProcessIdleSec: this.observationEmbedder ? unloadAfterSec : 'off',
       });
       return index;
     } catch (error) {
@@ -1283,6 +1300,8 @@ export class WorkerService implements WorkerRef {
         // Before the DB closes: a batch in flight finishes its write first.
         await this.observationVectorIndexer?.stop();
         this.observationVectorIndexer = null;
+        await this.observationEmbedder?.close();
+        this.observationEmbedder = null;
 
         await this.codexAgent.close();
         if (this.transcriptWatcher) {
