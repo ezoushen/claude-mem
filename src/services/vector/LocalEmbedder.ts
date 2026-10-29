@@ -70,9 +70,11 @@ export class LocalEmbedder implements Embedder {
     if (!this.loading) {
       this.loading = (async () => {
         const { AutoModel, AutoTokenizer } = await import('@huggingface/transformers');
+        const revision = this.model.revision ? { revision: this.model.revision } : {};
         this.extractor = {
-          tokenizer: await AutoTokenizer.from_pretrained(this.model.repo),
+          tokenizer: await AutoTokenizer.from_pretrained(this.model.repo, revision),
           model: await AutoModel.from_pretrained(this.model.repo, {
+            ...revision,
             dtype: this.model.dtype,
             ...(this.threads ? { session_options: { intraOpNumThreads: this.threads } } : {}),
           }),
