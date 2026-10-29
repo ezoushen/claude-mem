@@ -28,16 +28,25 @@ function memory(pid: number): string {
   const field = (name: string) => /\d+/.exec(status.split('\n').find(l => l.startsWith(name)) ?? '')?.[0];
   return `VmRSS ${Math.round(Number(field('VmRSS')) / 1024)} MB, VmHWM ${Math.round(Number(field('VmHWM')) / 1024)} MB`;
 }
-function children(pid: number): { pid: number; command: string }[] {
+/** Every process under `pid`, depth first, with its depth (chroma-mcp, for one, runs under uvx). */
+function descendants(pid: number): { pid: number; depth: number; command: string }[] {
+  let table: { pid: number; ppid: number; command: string }[];
   try {
-    return execFileSync('ps', ['-A', '-o', 'pid=,ppid=,command='], { encoding: 'utf8' }).split('\n')
-      .map(l => /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m && Number(m[2]) === pid)
-      .map(m => ({ pid: Number(m[1]), command: m[3] }));
+    table = execFileSync('ps', ['-A', '-o', 'pid=,ppid=,command='], { encoding: 'utf8' }).split('\n')
+      .map(l => /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m)
+      .map(m => ({ pid: Number(m[1]), ppid: Number(m[2]), command: m[3] }));
   } catch { return []; }
+  const walk = (parent: number, depth: number): { pid: number; depth: number; command: string }[] =>
+    table.filter(p => p.ppid === parent).flatMap(p => [{ pid: p.pid, depth, command: p.command }, ...walk(p.pid, depth + 1)]);
+  return walk(pid, 1);
 }
 
 console.log(`worker ${health.version} pid ${health.pid}: ${memory(health.pid)}`);
-for (const child of children(health.pid)) {
-  const name = child.command.includes('embed-child') ? 'embedding process' : child.command.split(' ').slice(0, 2).join(' ');
-  console.log(`  child ${child.pid} (${name}): ${memory(child.pid)}`);
+for (const child of descendants(health.pid)) {
+  const name = child.command.includes('embed-child') ? 'embedding process'
+    : child.command.includes('chroma-mcp') ? (child.command.includes('uvx') ? 'uvx for chroma-mcp' : 'chroma-mcp')
+      : child.command.split(' ').slice(0, 2).join(' ');
+  let usage: string;
+  try { usage = memory(child.pid); } catch { usage = 'gone'; }
+  console.log(`${'  '.repeat(child.depth)}child ${child.pid} (${name}): ${usage}`);
 }
