@@ -28,7 +28,7 @@ describe('embedding models', () => {
       'Xenova/paraphrase-multilingual-MiniLM-L12-v2/fp32/mean/l2/128',
       'Xenova/multilingual-e5-small/fp32/mean/l2/512',
       'onnx-community/granite-embedding-97m-multilingual-r2-ONNX/fp32/cls/l2/512',
-      'Xenova/bge-m3/fp32/cls/l2/512',
+      'Xenova/bge-m3/q8/cls/l2/512',
     ]);
   });
 

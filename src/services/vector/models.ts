@@ -18,7 +18,8 @@
 export interface EmbeddingModel {
   /** Hugging Face repository transformers.js loads. */
   repo: string;
-  dtype: 'fp32';
+  /** Part of the model id, so changing it re-indexes. */
+  dtype: EmbeddingDtype;
   /** mean: the average over real tokens; cls: the first token's vector. */
   pooling: 'mean' | 'cls';
   /** Vector length; sizes the server's vector(n) column. */
@@ -33,6 +34,9 @@ export interface EmbeddingModel {
   queryPrefix: string;
   passagePrefix: string;
 }
+
+/** The weight variants transformers.js selects between (the model repository's onnx/ files). */
+export type EmbeddingDtype = 'fp32' | 'fp16' | 'q8' | 'int8' | 'uint8' | 'q4' | 'q4f16' | 'bnb4';
 
 export const EMBEDDING_MODELS = {
   'all-MiniLM-L6-v2': {
@@ -83,13 +87,24 @@ export const EMBEDDING_MODELS = {
   // granite, and because 512 is what was measured: on a 205k-observation
   // mixed English/Chinese store it ranked best of these models, and was the
   // only one to find English notes from Chinese questions (#3610). It is
-  // about twenty times e5-small's compute and its fp32 weights are 2.3 GB
-  // (Xenova/bge-m3 also publishes fp16, int8 and q4 files, which this table's
-  // dtype does not select yet), so it suits a machine that can afford it,
-  // not a default.
+  // about twenty times e5-small's compute. Its fp32 weights are 2.3 GB; the
+  // 8-bit file (q8) is 0.57 GB, takes 1.8 GB of memory once loaded (2.2 GB at
+  // its peak) and is what this entry loads. Measured on the 205k-observation
+  // store with note vectors made at full precision and the 44 queries embedded
+  // by q8: fused nDCG@10 0.705 against 0.707, the worst query group losing
+  // 0.009 (the bar was 0.02 overall, 0.05 per group), a paired per-query loss
+  // of 0.002 +- 0.010. Notes embedded by q8 themselves were measured only on
+  // a 11k-note subset, where they passed provisionally (overall 0.698 against
+  // 0.706, natural-language queries 0.05 lower). The uint8 and int8 files are
+  // as small but lost 0.016 and 0.019 overall; fp16 is exact but half the
+  // speed at twice the size, and the 4-bit files are less exact (cosine 0.96
+  // to fp32 against 0.98) and slower. A CPU at half its threads embedded about
+  // 3 notes/s with q8 (measured on a busy machine), so a first index of a
+  // large store takes many hours, and this suits a machine that can afford
+  // the memory and the wait, not a default.
   'bge-m3': {
     repo: 'Xenova/bge-m3',
-    dtype: 'fp32',
+    dtype: 'q8',
     pooling: 'cls',
     dims: 1024,
     maxTokens: 512,
