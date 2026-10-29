@@ -1055,6 +1055,19 @@ var init_SettingsDefaultsManager = __esm({
         // every observation, and search by meaning covers only rows already
         // re-embedded until that finishes.
         CLAUDE_MEM_EMBEDDING_MODEL: "all-MiniLM-L6-v2",
+        // The local worker's search by meaning without Chroma: observations get a
+        // vector from CLAUDE_MEM_EMBEDDING_MODEL in claude-mem.db, embedded in the
+        // background (newest first), and keyword search results for observations
+        // are fused with the nearest vectors by reciprocal rank. Applies only when
+        // CLAUDE_MEM_CHROMA_ENABLED is 'false'. Restart the worker after changing.
+        CLAUDE_MEM_VECTOR_INDEX_ENABLED: "false",
+        // With the vector index on, the embedding model (over a gigabyte once loaded)
+        // normally lives in the worker for as long as the worker does. A positive
+        // number of seconds runs it in a child process instead, started when a search
+        // or a new observation needs a vector and ended after that many seconds
+        // without one, which returns its memory; the first request after that waits
+        // about a second for the model to load. Restart the worker after changing it.
+        CLAUDE_MEM_EMBEDDING_UNLOAD_AFTER_SEC: "0",
         CLAUDE_MEM_CHROMA_UVX_PATH: "",
         // Empty = search uv's install folders, then PATH (#4195)
         CLAUDE_MEM_SEARCH_RECENCY_DAYS: "90",
