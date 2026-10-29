@@ -2,8 +2,9 @@
 
 This branch (`local-vector-index` on [ezoushen/claude-mem](https://github.com/ezoushen/claude-mem)) gives
 the claude-mem worker search by meaning from vectors stored in `claude-mem.db` itself. It needs no Python,
-no `uv` and no `chroma-mcp` process. The model is `BAAI/bge-m3`, run in-process by transformers.js and
-onnxruntime-node, which the plugin already ships. Keyword results and vector results are fused by
+no `uv` and no `chroma-mcp` process. The model runs in-process on transformers.js and onnxruntime-node,
+which the plugin already ships: `all-MiniLM-L6-v2` by default, the model Chroma uses, or `BAAI/bge-m3`,
+which this guide recommends and sets up. Keyword results and vector results are fused by
 reciprocal rank.
 
 It is opt-in. With `CLAUDE_MEM_VECTOR_INDEX_ENABLED` unset or `false`, the worker behaves like stock
@@ -23,19 +24,25 @@ to set it up and reproduce the measurements on your own store.
 
 ## Why replace Chroma
 
-- **Quality.** Stock claude-mem 15.5.0 with Chroma on, run against the same notes and queries, scored
-  *below* keyword search alone (nDCG@10 0.376 against 0.401): it finds nothing for a question in one
-  language about notes in another, and Chinese term searches drop from 0.44 to 0.04. This branch scored
-  0.739 on the same store. See [Against Chroma](#against-chroma-measured).
+- **Quality.** Stock claude-mem 15.5.0 with Chroma on, run against the same notes and queries, gains nothing
+  overall over keyword search alone (nDCG@10 0.394 against 0.396): it helps English queries and loses
+  Chinese ones. It finds nothing for a question in one language
+  about notes in another, and Chinese term searches drop from 0.44 to 0.04. With the same model as Chroma
+  (its default), this branch scores 0.531, because it fuses keyword and vector results. With bge-m3 it
+  scores 0.734. See [Against Chroma](#against-chroma-measured) and the [test report](test-report.md).
 - **Moving parts.** Chroma needs Python, `uv` and a `chroma-mcp` process beside the worker, plus a second
   store to keep in step. Here the vectors are rows in `claude-mem.db`, with a foreign key to their
   observation, so a deleted observation takes its vector with it.
 - **Memory and disk.** Chroma keeps a `chroma-mcp` process and its index in memory for as long as the worker
   runs, and stores each note as several documents (narrative, text, every fact): 1.35 million documents
-  for a 215k-note store. This branch stores one 4 KB vector per note in `claude-mem.db`, holds them in
-  memory as 1 KB, and can run its model in a process that exits when idle: the worker then holds 0.4 GB.
+  for a 215k-note store, and a 6.9 GB folder. This branch stores one vector per note in `claude-mem.db`:
+  0.46 GB for that store with the default model, 1.01 GB with bge-m3. It holds the vectors in memory as
+  int8, and can run its model in a process that exits when idle. With bge-m3 the worker then holds
+  0.4 GB.
 - **Indexing.** Chroma indexed about 25 to 31 documents a second here, which is 12 to 15 hours for that
-  store. This branch's GPU script does it in 23 minutes; the worker alone, on the CPU, in most of a day.
+  store. With the default model this branch's worker indexed 22 notes a second on a busy CPU, about
+  2.7 hours for that store. With bge-m3 the GPU script does it in 23 minutes, the worker alone on the CPU
+  in most of a day.
 - **Reliability.** On this machine Chroma's index broke on 2026-09-12: `chroma-mcp` crash-looped about 60
   times an hour (1,063 crashes) on a write-ahead log it could not replay, and search by meaning silently fell
   back to keyword search for three days until the index was rebuilt from scratch. In late October its sync
@@ -54,35 +61,47 @@ Stock claude-mem 15.5.0 with Chroma on (local mode, default embedding function, 
 this branch with the index on, each run as its own worker on its own copy of the same store, scored with
 `eval-search.ts` on the 42 graded queries. Chroma would need 12 to 15 hours to index the whole store, so
 both ran on 11,056 notes: every note the judges graded plus 10,000 random ones (keyword search scores the
-same there as on the full store, 0.401 against 0.40). Chroma indexed all 11,056 (62,158 documents).
+same there as on the full store). Chroma indexed all 11,056 (62,158 documents). Every note any setup
+returned in its top 10 is graded; the [test report](test-report.md) has the method, per-query
+comparisons, speed and a correction to the first figures published here (Chroma 0.376 against keyword
+0.401, before a third of Chroma's results had been graded).
 
 | Worker | nDCG@10 | S@5 | agent | natural | zh-term | zh-cross | Search median |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| keyword only (Chroma off) | 0.401 | 0.64 | 0.553 | 0.419 | 0.441 | 0.000 | 29 ms |
-| Chroma, default 90-day window | 0.376 | 0.55 | 0.651 | 0.475 | 0.041 | 0.000 | 110 ms |
-| Chroma, window off | 0.373 | 0.55 | 0.642 | 0.446 | 0.083 | 0.000 | 112 ms |
-| **this branch** | **0.739** | **0.86** | 0.728 | 0.656 | 0.963 | 0.649 | 93 to 105 ms |
+| keyword only (Chroma off) | 0.396 | 0.64 | 0.553 | 0.401 | 0.441 | 0.000 | 16 to 29 ms |
+| Chroma, default 90-day window | 0.394 | 0.55 | 0.666 | 0.519 | 0.041 | 0.000 | 110 ms |
+| Chroma, window off | 0.390 | 0.55 | 0.660 | 0.479 | 0.088 | 0.000 | 112 ms |
+| this branch, default model (MiniLM, as Chroma) | 0.531 | 0.74 | 0.731 | 0.582 | 0.546 | 0.000 | 19 to 32 ms |
+| **this branch, bge-m3** | **0.734** | **0.86** | 0.728 | 0.636 | 0.959 | 0.660 | 105 ms |
 
 Memory on that store (macOS physical footprint; peak in brackets):
 
 | | Worker | Search process | While idle |
 | --- | --- | --- | --- |
 | Chroma | 75 to 98 MB | `chroma-mcp` 0.39 to 0.65 GB (0.82 GB), plus `uvx` 23 to 143 MB | the same: Chroma stays up |
-| this branch | 155 to 175 MB (0.20 GB) | embedding process 1.6 GB (2.1 GB while loading) | worker only, 155 MB, once the embedding process has exited |
+| this branch, default model | 130 MB (145 MB) | embedding process 233 to 289 MB (301 MB) | worker only, 114 MB, once the embedding process has exited |
+| this branch, default model kept in the worker (`UNLOAD_AFTER_SEC` 0, the default) | 292 MB (381 MB) | none | the same |
+| this branch, bge-m3 | 155 to 175 MB (0.20 GB) | embedding process 1.6 GB (2.1 GB while loading) | worker only, 155 MB, once the embedding process has exited |
 
-On disk: Chroma's index took 309 MB for these notes (about 5 KB per document), this branch's vectors 43 MB
-inside `claude-mem.db`. On the whole store, the Chroma folder this machine ran in production until 2026-10-28
-was 1.7 GB at 369,641 documents (2026-09-15), 5.1 GB on 2026-10-25, and freed 6.9 GB when it was deleted;
-this branch's vectors for the same store are 0.87 GB.
+On disk: Chroma's index took 309 MB for these notes (about 5 KB per document). This branch's vector table
+inside `claude-mem.db` took 24 MB with the default model and about 52 MB with bge-m3. On the whole store,
+the Chroma folder this machine ran in production until 2026-10-28 was 1.7 GB at 369,641 documents
+(2026-09-15) and 5.1 GB on 2026-10-25, and it freed 6.9 GB when it was deleted. This branch's table for
+the same store is 0.46 GB with the default model and 1.01 GB with bge-m3.
 
-At the whole store (215k notes) memory was measured for this branch only: worker 0.4 GB (0.9 GB peak),
-embedding process 0.8 to 1.3 GB while it runs. Chroma there would hold 1.35 million 384-dimension
+At the whole store (215k notes) memory was measured for this branch with bge-m3 only: worker 0.4 GB
+(0.9 GB peak), embedding process 0.8 to 1.3 GB while it runs. With the default model its in-memory
+vectors would be 85 MB instead of 223 MB (computed). Chroma there would hold 1.35 million 384-dimension
 vectors; their float32 values alone are 2.1 GB, which its HNSW index keeps in memory for as long as it runs.
 That is an estimate from the document count, not a measurement.
 
-The model is most of the difference. bge-m3 is a 568M-parameter multilingual model and MiniLM a 22M-parameter
-English one: Chroma's process is smaller while both are searching, and finds less. The branch pays for the
-larger model only while it is in use.
+Two things make the difference. With the same model, the branch scores +0.137 over
+Chroma (± 0.048 across the 42 queries), most likely because it fuses keyword and vector results where
+stock search ranks by Chroma's alone (the test does not separate this from embedding one document per
+note). bge-m3 then adds +0.203 (± 0.050): it is a 568M-parameter multilingual
+model, MiniLM a 22M-parameter English one. With the default model the branch costs less than Chroma in
+total memory, disk, search time and indexing time. With bge-m3 its embedding process is larger than `chroma-mcp` while it runs, and the
+branch pays for that only while the model is in use.
 
 ### Which model (2026-10-28, offline, 42 judged queries)
 
@@ -203,8 +222,8 @@ replace it: set `"autoUpdate": false` for `thedotmack` in `~/.claude/plugins/kno
 | Setting | Meaning |
 | --- | --- |
 | `CLAUDE_MEM_VECTOR_INDEX_ENABLED` | `true` turns the index on. Ignored, with a warning, while Chroma is on. |
-| `CLAUDE_MEM_EMBEDDING_MODEL` | `bge-m3` for the results above. `all-MiniLM-L6-v2` (the default) and the other models in `src/services/vector/models.ts` also work. |
-| `CLAUDE_MEM_EMBEDDING_UNLOAD_AFTER_SEC` | `0` (default) keeps the model in the worker. A number of seconds runs it in `scripts/embed-child.cjs`, which starts on demand and exits after that long without a request; the first search after that waits about a second. |
+| `CLAUDE_MEM_EMBEDDING_MODEL` | `bge-m3` for the best results above; `all-MiniLM-L6-v2` (the default) is smaller and faster (see the [test report](test-report.md)). The other models in `src/services/vector/models.ts` also work. |
+| `CLAUDE_MEM_EMBEDDING_UNLOAD_AFTER_SEC` | `0` (default) keeps the model in the worker. A number of seconds runs it in `scripts/embed-child.cjs`, which starts on demand and exits after that long without a request; the first search after that waits while the model loads (about a second for bge-m3, 0.15 s for MiniLM). |
 | `CLAUDE_MEM_EMBEDDING_BACKFILL_THREADS` | CPU threads for the model. Empty is half of them, `0` is all. |
 
 **4. The model.** The first vector request downloads it from Hugging Face into the plugin's
@@ -277,8 +296,8 @@ legacy `text`, each trimmed, empty ones dropped, joined by newlines; see `observ
 2. Collect candidates: run them with the index off and on (below), and any other method you want to compare;
    take the top 10 of each per query.
 3. Grade every candidate 0, 1 or 2 without seeing which method found it, into
-   `qrels.json`: `{ "n01": { "18234": 2, "18240": 1 } }`. The results above used four Claude Sonnet judges on
-   the note titles and subtitles.
+   `qrels.json`: `{ "n01": { "18234": 2, "18240": 1 } }`. Grade every note any compared setup returns in
+   its top 10. The results above used Claude Sonnet judges on the note titles and subtitles.
 4. Score the worker both ways, noting the highest observation id when you grade so later notes do not count:
 
 ```bash
@@ -317,7 +336,8 @@ back on and restart.
 - The comparison with Chroma ran on 11k of the 215k notes. At the full store, Chroma's disk size comes from
   the production install it replaced (whether that index was complete when deleted is not known), and its
   memory was not measured.
-  Grading was pooled (a relevant note no method found is never graded) and done by a model.
+  Grading was pooled (a relevant note no method found is never graded) and done by a model, in two passes
+  that agree within one grade on 99 % of a shared sample; see the [test report](test-report.md#grading).
 - Only observations are embedded; summaries and prompts stay keyword-only. One document per observation
   (title, subtitle and narrative), where Chroma and #3694 split notes into several.
 - Filling the index on the CPU takes hours for a large store; the GPU script is for Apple Silicon only.
