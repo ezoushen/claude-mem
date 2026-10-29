@@ -23,23 +23,58 @@ to set it up and reproduce the measurements on your own store.
 
 ## Why replace Chroma
 
-- **Quality.** Chroma's default embedding function, and PR #3694, use `all-MiniLM-L6-v2`. On a real store
-  it scored no better than keyword search (nDCG@10 0.39 against 0.40) and found nothing for a question in
-  one language about notes in another. bge-m3 fused with keyword search scored 0.71, and 0.62 on
-  cross-language questions.
+- **Quality.** Stock claude-mem 15.5.0 with Chroma on, run against the same notes and queries, scored
+  *below* keyword search alone (nDCG@10 0.376 against 0.401): it finds nothing for a question in one
+  language about notes in another, and Chinese term searches drop from 0.44 to 0.04. This branch scored
+  0.739 on the same store. See [Against Chroma](#against-chroma-measured).
 - **Moving parts.** Chroma needs Python, `uv` and a `chroma-mcp` process beside the worker, plus a second
   store to keep in step. Here the vectors are rows in `claude-mem.db`, with a foreign key to their
   observation, so a deleted observation takes its vector with it.
-- **Memory.** On a 214k-observation store the worker holds about 1.1 GB with the model loaded, or about
-  0.5 GB when the model runs in a separate process that exits when idle (see below).
+- **Memory and disk.** Chroma keeps a `chroma-mcp` process and its index in memory for as long as the worker
+  runs, and stores each note as several documents (narrative, text, every fact): 1.35 million documents
+  for a 215k-note store. This branch stores one 4 KB vector per note in `claude-mem.db`, holds them in
+  memory as 1 KB, and can run its model in a process that exits when idle: the worker then holds 0.4 GB.
+- **Indexing.** Chroma indexed about 25 to 31 documents a second here, which is 12 to 15 hours for that
+  store. This branch's GPU script does it in 23 minutes; the worker alone, on the CPU, in most of a day.
 
 The numbers come from one store (claude-mem 15.4.0 to 15.5.0, 205k to 214k observations, mostly English
 with about 700 Chinese notes, Apple M5 Max with 128 GB). The queries and grades describe private work, so
 they are not published; the method and the tools are, so you can measure your own store the same way.
-Chroma itself was not measured: the comparison is with keyword search, which is what the worker does with
-Chroma off, and with MiniLM, the model Chroma embeds with by default.
 
 ## Results
+
+### Against Chroma (measured)
+
+Stock claude-mem 15.5.0 with Chroma on (local mode, default embedding function, so `all-MiniLM-L6-v2`), and
+this branch with the index on, each run as its own worker on its own copy of the same store, scored with
+`eval-search.ts` on the 42 graded queries. Chroma would need 12 to 15 hours to index the whole store, so
+both ran on 11,056 notes: every note the judges graded plus 10,000 random ones (keyword search scores the
+same there as on the full store, 0.401 against 0.40). Chroma indexed all 11,056 (62,158 documents).
+
+| Worker | nDCG@10 | S@5 | agent | natural | zh-term | zh-cross | Search median |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| keyword only (Chroma off) | 0.401 | 0.64 | 0.553 | 0.419 | 0.441 | 0.000 | 29 ms |
+| Chroma, default 90-day window | 0.376 | 0.55 | 0.651 | 0.475 | 0.041 | 0.000 | 110 ms |
+| Chroma, window off | 0.373 | 0.55 | 0.642 | 0.446 | 0.083 | 0.000 | 112 ms |
+| **this branch** | **0.739** | **0.86** | 0.728 | 0.656 | 0.963 | 0.649 | 93 to 105 ms |
+
+Memory on that store (macOS physical footprint; peak in brackets):
+
+| | Worker | Search process | While idle |
+| --- | --- | --- | --- |
+| Chroma | 75 to 98 MB | `chroma-mcp` 0.39 to 0.65 GB (0.82 GB), plus `uvx` 23 to 143 MB | the same: Chroma stays up |
+| this branch | 155 to 175 MB (0.20 GB) | embedding process 1.6 GB (2.1 GB while loading) | worker only, 155 MB, once the embedding process has exited |
+
+On disk: Chroma's index took 309 MB for these notes, this branch's vectors 43 MB inside `claude-mem.db`.
+
+At the whole store (215k notes) only this branch was measured: worker 0.4 GB (0.9 GB peak), embedding process
+0.8 to 1.3 GB while it runs, vectors 0.87 GB on disk. Chroma there would hold 1.35 million 384-dimension
+vectors; their float32 values alone are 2.1 GB, which its HNSW index keeps in memory for as long as it runs.
+That is an estimate from the document count, not a measurement.
+
+The model is most of the difference. bge-m3 is a 568M-parameter multilingual model and MiniLM a 22M-parameter
+English one: Chroma's process is smaller while both are searching, and finds less. The branch pays for the
+larger model only while it is in use.
 
 ### Which model (2026-10-28, offline, 42 judged queries)
 
@@ -271,6 +306,7 @@ back on and restart.
 ## Limits
 
 - One store, one owner, 42 graded queries with 7 to 15 per group: differences of a few hundredths are noise.
+- The comparison with Chroma ran on 11k of the 215k notes; at the full store only this branch was measured.
   Grading was pooled (a relevant note no method found is never graded) and done by a model.
 - Only observations are embedded; summaries and prompts stay keyword-only. One document per observation
   (title, subtitle and narrative), where Chroma and #3694 split notes into several.
