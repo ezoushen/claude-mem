@@ -1,5 +1,9 @@
 # Local vector index: search by meaning without Chroma
 
+For the separate 16.0.1 integration branch containing this vector stack and the Pi
+resume-memory repair, see [the integration release guide](release-16.0.1-pi.md).
+The historical `local-vector-index` branch and measurements below are retained.
+
 This branch (`local-vector-index` on [ezoushen/claude-mem](https://github.com/ezoushen/claude-mem)) gives
 the claude-mem worker search by meaning from vectors stored in `claude-mem.db` itself. It needs no Python,
 no `uv` and no `chroma-mcp` process. The model runs in-process on transformers.js and onnxruntime-node,

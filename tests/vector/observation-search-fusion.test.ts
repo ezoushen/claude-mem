@@ -39,7 +39,7 @@ describe('reciprocalRankFusion', () => {
 describe('SearchManager with the vector index', () => {
   function manager(vectors: ObservationVectorIndex | null): SearchManager {
     return new SearchManager(new SessionSearch(store.db), store, null,
-      new FormattingService(), new TimelineService(), undefined, null, vectors);
+      new FormattingService(), new TimelineService(), undefined, null, null, vectors);
   }
 
   it('fuses keyword and vector observation results', async () => {
