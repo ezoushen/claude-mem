@@ -1,5 +1,23 @@
 # Pi native prompt capture
 
+## Memory across resume
+
+After a prompt passes the worker's admission checks, the extension saves the initial
+memory snapshot in a `claude-mem-memory` custom Pi session entry. Reload, resume and
+branch selection restore that exact leading-system snapshot. A refresh that changes
+only the rendered clock or work-state ages does not add context. Changed notes are
+saved at the next new user prompt and rendered as a custom context message after
+that prompt; older messages and the leading snapshot remain unchanged. Resuming a
+tool continuation defers the refresh until a new prompt. Compaction carries the
+latest snapshot whose prompt is no longer present into the retained context.
+
+These entries contain the memory text as private conversation state, rather than
+hash-only diagnostics. Excluded turns do not save or expose snapshots. A checkout
+change starts its own snapshot; forks in the same checkout use their selected branch.
+If Pi cannot persist the first snapshot, the request continues without memory
+injection. Sessions predating this change may need one cold baseline because their
+old transient memory text was not saved.
+
 ## Install and check capture compatibility
 
 Choose Pi with `npx claude-mem install --ide pi`, then restart Pi to load the extension. `npx claude-mem pi status` reports whether the extension files exist. Installation and status do not check the Pi version or verify automatic memory capture, and they do not upgrade Pi.
