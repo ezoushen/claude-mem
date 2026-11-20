@@ -1,0 +1,7 @@
+# Versions the 2026-10-29 backfill of 212k notes ran with (Python 3.12, Apple M5 Max).
+mlx==0.32.4
+mlx-embeddings==0.1.0
+numpy==2.5.4
+transformers==5.21.0
+tokenizers==0.23.3
+huggingface-hub==2.3.0

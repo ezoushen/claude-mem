@@ -378,8 +378,10 @@ export interface SettingsDefaults {
   CLAUDE_MEM_CHROMA_PROCESS_NICE: string;         // niceness for chroma-mcp (non-Windows, needs `nice`); 0 = off, 0-19
   CLAUDE_MEM_CHROMA_EMBEDDING_FUNCTION: string;  // chroma-mcp embedding function for new collections
   CLAUDE_MEM_SERVER_VECTOR_SEARCH: string;       // server search by meaning: 'auto', 'true' or 'false'
-  CLAUDE_MEM_EMBEDDING_BACKFILL_THREADS: string; // hosted server only (local Chroma's embedder can't be capped from claude-mem): CPU threads for embedding stored rows; '' = half, 0 = all
-  CLAUDE_MEM_EMBEDDING_MODEL: string;            // in-process embedding model for server search by meaning
+  CLAUDE_MEM_EMBEDDING_BACKFILL_THREADS: string; // CPU threads for embedding stored rows; '' = half, 0 = all
+  CLAUDE_MEM_EMBEDDING_MODEL: string;            // in-process embedding model for search by meaning (server, and the worker's vector index)
+  CLAUDE_MEM_VECTOR_INDEX_ENABLED: string;       // worker search by meaning from an in-file vector index: 'true' or 'false'
+  CLAUDE_MEM_EMBEDDING_UNLOAD_AFTER_SEC: string; // run the vector index's model in a process that exits after this many idle seconds; '0' = in the worker
   CLAUDE_MEM_CHROMA_UVX_PATH: string;            // uvx binary (or its folder) to launch chroma-mcp with
   CLAUDE_MEM_SEARCH_RECENCY_DAYS: string;        // Implicit 90-day recency window on date-less semantic searches (#4770); 0 = no window
   // Worker-native cloud sync. Active ⇔ TOKEN, USER_ID, and HUB_URL are all
@@ -737,6 +739,19 @@ export class SettingsDefaultsManager {
     // every observation, and search by meaning covers only rows already
     // re-embedded until that finishes.
     CLAUDE_MEM_EMBEDDING_MODEL: 'all-MiniLM-L6-v2',
+    // The local worker's search by meaning without Chroma: observations get a
+    // vector from CLAUDE_MEM_EMBEDDING_MODEL in claude-mem.db, embedded in the
+    // background (newest first), and keyword search results for observations
+    // are fused with the nearest vectors by reciprocal rank. Applies only when
+    // CLAUDE_MEM_CHROMA_ENABLED is 'false'. Restart the worker after changing.
+    CLAUDE_MEM_VECTOR_INDEX_ENABLED: 'false',
+    // With the vector index on, the embedding model (over a gigabyte once loaded)
+    // normally lives in the worker for as long as the worker does. A positive
+    // number of seconds runs it in a child process instead, started when a search
+    // or a new observation needs a vector and ended after that many seconds
+    // without one, which returns its memory; the first request after that waits
+    // about a second for the model to load. Restart the worker after changing it.
+    CLAUDE_MEM_EMBEDDING_UNLOAD_AFTER_SEC: '0',
     CLAUDE_MEM_CHROMA_UVX_PATH: '',            // Empty = search uv's install folders, then PATH (#4195)
     CLAUDE_MEM_SEARCH_RECENCY_DAYS: '90',      // Date-less semantic search only ranks matches from the last N days (#4770). 0 = no window (every match eligible); an explicit dateStart/dateEnd always wins. Restart the worker after changing it
     // Worker-native cloud sync: credentials come from cmem.ai → Connect.

@@ -1,5 +1,5 @@
 import type { Embedder } from './types.js';
-import { DEFAULT_EMBEDDING_MODEL, type EmbeddingModel } from './models.js';
+import { DEFAULT_EMBEDDING_MODEL, embeddingModelId, type EmbeddingModel } from './models.js';
 
 /**
  * Documents per forward pass.
@@ -55,9 +55,7 @@ export class LocalEmbedder implements Embedder {
     private readonly model: EmbeddingModel = DEFAULT_EMBEDDING_MODEL,
     readonly threads?: number,
   ) {
-    // The token limit is part of the identity: the same model truncated
-    // elsewhere produces different vectors for long texts.
-    this.modelId = `${model.repo}/${model.dtype}/${model.pooling}/l2/${model.maxTokens}`;
+    this.modelId = embeddingModelId(model);
     this.dims = model.dims;
   }
 
@@ -72,9 +70,11 @@ export class LocalEmbedder implements Embedder {
     if (!this.loading) {
       this.loading = (async () => {
         const { AutoModel, AutoTokenizer } = await import('@huggingface/transformers');
+        const revision = this.model.revision ? { revision: this.model.revision } : {};
         this.extractor = {
-          tokenizer: await AutoTokenizer.from_pretrained(this.model.repo),
+          tokenizer: await AutoTokenizer.from_pretrained(this.model.repo, revision),
           model: await AutoModel.from_pretrained(this.model.repo, {
+            ...revision,
             dtype: this.model.dtype,
             ...(this.threads ? { session_options: { intraOpNumThreads: this.threads } } : {}),
           }),
