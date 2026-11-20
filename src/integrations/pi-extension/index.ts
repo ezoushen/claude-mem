@@ -15,11 +15,27 @@ interface PiMessage {
   role?: string;
   content?: unknown;
   timestamp?: number;
+  customType?: string;
+  display?: boolean;
 }
 interface PiSessionEntry {
   type?: string;
   id?: string;
   message?: PiMessage;
+  customType?: string;
+  data?: MemorySnapshot;
+}
+interface MemorySnapshot {
+  version: 1;
+  cwd: string;
+  anchorId: string;
+  memory: string;
+}
+const MEMORY_ENTRY = 'claude-mem-memory';
+
+function memoryIdentity(memory: string): string {
+  return memory.replace(/^(# \[[^\n]*\] recent context, )[^\n]*$/gm, '$1<TIME>')
+    .replace(/, updated (?:about )?\d+ (?:minutes?|hours?|days?) ago$/gm, ', updated <AGE>');
 }
 interface PiContext {
   cwd: string;
@@ -55,12 +71,13 @@ interface PiTool {
 export interface PiExtensionAPI {
   on(event: string, handler: (event: PiEvent, context: PiContext) => unknown): void;
   registerTool(tool: PiTool): void;
+  appendEntry(customType: string, data: MemorySnapshot): void;
 }
 
 interface Session {
   id: string;
   cwd: string;
-  memory: string;
+  memory?: string;
   anchored: boolean;
   excluded: boolean;
   queue: Promise<void>;
@@ -116,7 +133,7 @@ export default function claudeMemPi(pi: PiExtensionAPI): void {
     const id = ctx.sessionManager.getSessionId();
     if (!id || !ctx.cwd) { current = undefined; return; }
     const session: Session = {
-      id, cwd: ctx.cwd, memory: '', anchored: false, excluded: false,
+      id, cwd: ctx.cwd, anchored: false, excluded: false,
       queue: Promise.resolve(), lastAssistant: '', needsSummary: false, initialized: false,
     };
     current = session;
@@ -242,11 +259,47 @@ export default function claudeMemPi(pi: PiExtensionAPI): void {
         throw error;
       }
     });
-    if (current !== session || !session.anchored || session.excluded || !session.memory) return;
+    if (!ownsCapture(session, ctx) || !session.anchored || session.excluded) return;
+    const branch = ctx.sessionManager.getBranch!();
+    const snapshots = branch.filter(entry => entry.type === 'custom' && entry.customType === MEMORY_ENTRY
+      && entry.data?.version === 1 && entry.data.cwd === session.cwd && typeof entry.data.memory === 'string'
+      && typeof entry.data.anchorId === 'string').map(entry => entry.data!);
+    const anchorIndex = (snapshot: MemorySnapshot): number => {
+      const anchor = branch.find(entry => entry.id === snapshot.anchorId)?.message;
+      if (!anchor) return -1;
+      const text = extractTextContent(anchor.content);
+      const peers = branch.filter(entry => entry.type === 'message' && entry.message?.role === 'user'
+        && entry.message.timestamp === anchor.timestamp && extractTextContent(entry.message.content) === text);
+      const indices = messages.flatMap((message, index) => message.role === 'user'
+        && message.timestamp === anchor.timestamp && extractTextContent(message.content).startsWith(text) ? [index] : []);
+      return indices[indices.length - peers.length + peers.findIndex(entry => entry.id === snapshot.anchorId)] ?? -1;
+    };
+    const fresh: MemorySnapshot = { version: 1, cwd: session.cwd, anchorId: session.entryId!, memory: session.memory ?? '' };
+    const at = anchorIndex(fresh);
+    const newPrompt = at >= 0 && !messages.slice(at + 1).some(message => message.role === 'assistant' || message.role === 'toolResult');
+    if (session.memory !== undefined && (!snapshots.length || (newPrompt
+      && memoryIdentity(snapshots.at(-1)!.memory) !== memoryIdentity(session.memory)))) {
+      try {
+        pi.appendEntry(MEMORY_ENTRY, fresh);
+        snapshots.push(fresh);
+      } catch (error) { warn(ctx, error); }
+    }
+    if (!snapshots.length) return;
+    const memory = snapshots[0].memory;
     const injected = [...messages];
-    injected[systemIndex] = { ...system, content: base + '\n\n<claude-mem-context>\n'
-      + session.memory + '\n</claude-mem-context>' };
-    return { messages: injected };
+    if (memory) injected[systemIndex] = { ...system, content: base + '\n\n<claude-mem-context>\n'
+      + memory + '\n</claude-mem-context>' };
+    const updates = new Map<number, PiMessage[]>();
+    for (const snapshot of snapshots.slice(1)) {
+      const index = anchorIndex(snapshot);
+      const message: PiMessage = { role: 'custom', customType: MEMORY_ENTRY, display: false,
+        content: '<claude-mem-context>\n' + snapshot.memory + '\n</claude-mem-context>',
+        timestamp: branch.find(entry => entry.id === snapshot.anchorId)?.message?.timestamp };
+      const position = index < 0 ? systemIndex : index;
+      if (index < 0) updates.set(position, [message]);
+      else updates.set(position, [...(updates.get(position) ?? []), message]);
+    }
+    return { messages: injected.flatMap((message, index) => [message, ...(updates.get(index) ?? [])]) };
   });
 
   pi.on('tool_result', (event, ctx) => {

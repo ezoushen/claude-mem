@@ -12,6 +12,13 @@ let messages: any[];
 let stamp: number;
 let initResponse: (body: any) => Promise<Response>;
 let capabilityResponse: () => Promise<Response>;
+let memoryText: string;
+const activate = () => {
+  handlers = new Map();
+  extension({ on: (name, handler) => handlers.set(name, handler), registerTool: tool => tools.set(tool.name, tool),
+    appendEntry: (customType, data) => branch.push({ type: 'custom', id: `memory-${branch.length}`, customType, data }),
+  } as PiExtensionAPI);
+};
 const acknowledge = (body: any, extra: object = {}) =>
   Response.json({ sessionDbId: 42, nativePromptId: body.nativePromptId, nativePromptCurrent: true, ...extra });
 const useSession = (sid: string, cwd = '/work/project') => {
@@ -25,16 +32,17 @@ beforeEach(() => {
   useSession('real-session-id');
   initResponse = async body => acknowledge(body);
   capabilityResponse = async () => Response.json({ nativePromptId: 1 });
+  memoryText = 'Useful project memory';
   globalThis.fetch = (async (input: string | URL | Request, options?: RequestInit) => {
     const url = new URL(String(input));
     const body = typeof options?.body === 'string' ? JSON.parse(options.body) : undefined;
     calls.push({ route: url.pathname, url, body });
     if (url.pathname === '/api/sessions/native-prompt-capability') return capabilityResponse();
     if (url.pathname === '/api/sessions/init') return initResponse(body);
-    if (url.pathname === '/api/context/inject') return new Response('Useful project memory');
+    if (url.pathname === '/api/context/inject') return new Response(memoryText);
     return Response.json({ content: [{ type: 'text', text: 'Found memory' }] });
   }) as typeof fetch;
-  extension({ on: (name, handler) => handlers.set(name, handler), registerTool: tool => tools.set(tool.name, tool) } as PiExtensionAPI);
+  activate();
 });
 afterEach(() => { globalThis.fetch = originalFetch; });
 const emit = async (name: string, event: any = {}) => handlers.get(name)?.(event, context);
@@ -52,6 +60,118 @@ const ask = async (text: string, id: string, timestamp = ++stamp) => {
 const inits = () => calls.filter(call => call.route === '/api/sessions/init');
 
 describe('native Pi capture', () => {
+  it('preserves the admitted leading memory bytes across a fresh extension activation', async () => {
+    memoryText = '# [project] recent context, 2026-11-20 08:50am GMT+8\n- Work state, updated 2 minutes ago\nSaved project notes';
+    await emit('session_start');
+    const first = await ask('First request', 'first-user');
+    memoryText = '# [project] recent context, 2026-11-20 09:50am GMT+8\n- Work state, updated about 2 hours ago\nSaved project notes';
+    activate();
+    await emit('session_start', { reason: 'resume' });
+    const resumed = await ask('Second request', 'second-user');
+    expect(resumed.messages[0].content).toBe(first.messages[0].content);
+    expect(branch.filter(entry => entry.customType === 'claude-mem-memory')).toHaveLength(1);
+  });
+
+  it('persists changed notes after the new prompt and restores that position on another resume', async () => {
+    await emit('session_start');
+    const first = await ask('First request', 'first-user');
+    const firstUser = messages[1];
+    memoryText = 'New project notes';
+    activate();
+    await emit('session_start', { reason: 'resume' });
+    await emit('before_agent_start');
+    const user = { role: 'user', content: 'Second request', timestamp: ++stamp };
+    branch.push({ type: 'message', id: 'second-user', message: user });
+    messages = [messages[0], firstUser, { role: 'assistant', content: 'First answer', timestamp: 1000 }, user];
+    const updated = await request();
+    expect(updated.messages.slice(0, first.messages.length)).toEqual(first.messages);
+    expect(updated.messages.at(-1)).toMatchObject({ role: 'custom', customType: 'claude-mem-memory', timestamp: user.timestamp });
+    expect(updated.messages.at(-1).content).toContain('New project notes');
+    expect(await request()).toEqual(updated);
+    activate();
+    await emit('session_start', { reason: 'resume' });
+    expect(await request()).toEqual(updated);
+    expect(branch.filter(entry => entry.customType === 'claude-mem-memory')).toHaveLength(2);
+  });
+
+  it('restores the selected branch memory without borrowing a later branch or another checkout', async () => {
+    memoryText = 'Original branch notes';
+    await emit('session_start');
+    const first = await ask('First request', 'first-user');
+    const selected = [...branch];
+    memoryText = 'Later branch notes';
+    activate();
+    await emit('session_start', { reason: 'resume' });
+    await ask('Later request', 'later-user');
+    branch = selected;
+    context.sessionManager.getEntries = () => [...selected, { type: 'custom', customType: 'claude-mem-memory',
+      data: { version: 1, cwd: '/work/project', anchorId: 'hidden-user', memory: 'Unselected private notes' } }];
+    await emit('session_tree');
+    const restored = await ask('Selected branch request', 'selected-user');
+    expect(restored.messages[0].content).toBe(first.messages[0].content);
+    expect(JSON.stringify(restored)).not.toContain('Unselected private notes');
+    const inherited = [...branch];
+    useSession('fork-in-another-project', '/work/another');
+    branch = inherited;
+    memoryText = 'Other checkout notes';
+    activate();
+    await emit('session_start', { reason: 'fork' });
+    const other = await ask('Other project request', 'other-user');
+    expect(other.messages[0].content).toContain('Other checkout notes');
+    expect(JSON.stringify(other)).not.toContain('Original branch notes');
+  });
+
+  it('keeps snapshots out of excluded turns and fails open if Pi cannot persist memory', async () => {
+    await emit('session_start');
+    initResponse = async () => Response.json({ skipped: true, reason: 'project_excluded' });
+    expect(await ask('Excluded request', 'excluded-user')).toBeUndefined();
+    expect(branch.some(entry => entry.customType === 'claude-mem-memory')).toBe(false);
+    handlers = new Map();
+    extension({ on: (name, handler) => handlers.set(name, handler), registerTool() {},
+      appendEntry() { throw new Error('session is read only'); },
+    } as PiExtensionAPI);
+    initResponse = async body => acknowledge(body);
+    await emit('session_start');
+    expect(await ask('Read-only request', 'read-only-user')).toBeUndefined();
+  });
+
+  it('defers fresh notes during a continued tool turn and keeps the latest pruned snapshot after compaction', async () => {
+    await emit('session_start');
+    const first = await ask('First request', 'first-user');
+    messages.push({ role: 'assistant', content: 'Still working', timestamp: 1000 });
+    memoryText = 'Refreshed notes';
+    activate();
+    await emit('session_start', { reason: 'resume' });
+    const continued = await request();
+    expect(continued.messages.slice(0, first.messages.length)).toEqual(first.messages);
+    expect(continued.messages).toHaveLength(3);
+    expect(branch.filter(entry => entry.customType === 'claude-mem-memory')).toHaveLength(1);
+    const second = await ask('Second request', 'second-user');
+    expect(second.messages.at(-1).content).toContain('Refreshed notes');
+    messages = [{ role: 'system', content: 'Base prompt' }, { role: 'compactionSummary', summary: 'Previous work', timestamp: 2000 }];
+    const third = { role: 'user', content: 'After compaction', timestamp: ++stamp };
+    branch.push({ type: 'message', id: 'third-user', message: third });
+    messages.push(third);
+    const compacted = await request();
+    expect(compacted.messages[0].content).toBe(first.messages[0].content);
+    expect(compacted.messages[1]).toMatchObject({ role: 'custom', customType: 'claude-mem-memory' });
+    expect(compacted.messages[1].content).toContain('Refreshed notes');
+    expect(await request()).toEqual(compacted);
+  });
+
+  it('keeps an initially empty system prefix when memory becomes available later', async () => {
+    memoryText = '';
+    await emit('session_start');
+    const first = await ask('First request', 'first-user') ?? { messages };
+    expect(first.messages[0].content).toBe('Base prompt');
+    memoryText = 'Newly available memory';
+    activate();
+    await emit('session_start', { reason: 'resume' });
+    const updated = await ask('Second request', 'second-user');
+    expect(updated.messages[0].content).toBe('Base prompt');
+    expect(updated.messages.at(-1).content).toContain('Newly available memory');
+  });
+
   it('waits for the persisted user entry, retains the real SID/cwd, and preserves system context fields', async () => {
     await emit('session_start', { reason: 'new', sessionId: 'wrong-event-id' });
     expect(calls.map(call => call.route)).toEqual(['/api/health', '/api/context/inject']);
