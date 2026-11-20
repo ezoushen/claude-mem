@@ -11,7 +11,7 @@ export function workerBinaryBuildOptions({ root = process.cwd(), outfile, target
   return {
     entrypoints: [path.join(root, 'src/services/worker-service.ts'), path.join(root, 'src/services/context/context-read-worker.ts'), path.join(root, 'src/services/work-view/work-view-read-worker.ts')],
     target: 'bun', naming: '[name].js', minify: true,
-    external: ['@opentelemetry/api', 'sharp'],
+    external: ['@opentelemetry/api', 'sharp', '@huggingface/transformers', 'onnxruntime-node'],
     define: { '__CMEM_MEDIA_STANDALONE__': 'true' },
     compile: { outfile, autoloadPackageJson: true, ...(target ? { target } : {}) },
     plugins: [{ name: 'single-zod-entry', setup(builder) {
