@@ -44,11 +44,14 @@ async function capturePiResult(content: unknown, isError = false) {
   const handlers = new Map<string, (...args: any[]) => any>();
   const warnings: string[] = [];
   const user = { role: 'user', content: 'Inspect the output', timestamp: Date.now() };
+  const entries: any[] = [{ type: 'message', id: 'pi-native-entry', message: user }];
   const context = { cwd, hasUI: true, ui: { notify: (message: string) => warnings.push(message) },
     sessionManager: { getSessionId: () => 'pi-private-boundary',
-      getBranch: () => [{ type: 'message', id: 'pi-native-entry', message: user }] } };
+      getBranch: () => entries } };
   try {
-    extension({ on: (name, handler) => handlers.set(name, handler), registerTool() {} } as PiExtensionAPI);
+    extension({ on: (name, handler) => handlers.set(name, handler), registerTool() {},
+      appendEntry: (customType, data) => entries.push({ type: 'custom', customType, data }),
+    } as PiExtensionAPI);
     await handlers.get('session_start')!({}, context);
     await handlers.get('before_agent_start')!({}, context);
     await handlers.get('context_with_system')!({ messages: [{ role: 'system', content: 'System' }, user] }, context);
